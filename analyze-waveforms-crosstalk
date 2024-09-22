@@ -68,8 +68,8 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     
-    calib_file = ROOT.TFile("/Users/albertodufour/Desktop/tesi/macros/master_calib.root", "READ")
-    #calib_file = ROOT.TFile("/home/cmsdaq/DAQ/qaqc_jig/macros/master_calib.root", "READ")
+    
+    calib_file = ROOT.TFile("/home/cmsdaq/DAQ/qaqc_jig/macros/master_calib.root", "READ")
     gMasterCalib_spe = None
     gMasterCalib_lyso = None
     print(args.slot,args.plot)
