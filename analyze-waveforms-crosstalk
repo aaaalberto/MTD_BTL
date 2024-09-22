@@ -1,0 +1,818 @@
+#! /usr/bin/env python3
+# NOTE: DA IMPORTARE ANCHE fit_ct_ratio da crosstalk_utils
+# NOTE: ho anche aggiunto un argomento printstats=True a plot_graph in plot_utils in btl 
+# (per non stamparmi media e RMS su crosstalk, inutile e copre tutto)
+
+
+
+"""
+Creates charge histograms from hdf5 files made from `wavedump` or
+`acquire-waveforms`.
+"""
+
+from __future__ import print_function, division
+import h5py
+import numpy as np
+from scipy import signal
+import os
+import sys
+import math
+from enum import Enum
+from array import array
+
+canvas = []
+
+# How much does the attenuator attenuate the signal relative to the no
+# attenuation path. This can be calculated using the pi_pad_calculator.py
+# script.
+ATTENUATION_FACTOR = 5.85
+
+# Radioactive sources with their gamma energies in keV.
+#SOURCES = {'lyso': 307, 'sodium': 511, 'cesium': 662, 'cobalt': 122}
+SOURCES = {'lyso': 662, 'sodium': 511, 'cesium': 662, 'cobalt': 122}
+
+
+if __name__ == '__main__':
+    from argparse import ArgumentParser
+    import ROOT
+    from ROOT import gROOT
+    from utilities import tdrstyle
+    import matplotlib.pyplot as plt
+    import psycopg2
+    import psycopg2.extensions
+    from btl import fit_spe_funcs
+    #from btl import fit_lyso_funcs
+    from btl import fit_gamma_funcs
+    from btl import fit_intrinsic_funcs
+    from btl import plot_utils
+    from btl import crosstalk_utils
+
+    tdrstyle.setTDRStyle()
+    ROOT.gStyle.SetOptStat(0)
+    ROOT.gStyle.SetOptFit(0)
+    ROOT.gStyle.SetTitleOffset(1.25,'Y')
+    ROOT.gErrorIgnoreLevel = ROOT.kWarning
+    
+    parser = ArgumentParser(description='Analyze SPE and source (LYSO or external source) charges')
+    parser.add_argument('filename',help='input filename (hdf5 format)')
+    parser.add_argument('-o','--output', default='delete_me.root', help='output file name')
+    parser.add_argument('--plot', default=False, action='store_true', help='plot the waveforms and charge integral')
+    parser.add_argument('--chunks', default=10000, type=int, help='number of waveforms to process at a time')
+    parser.add_argument('--sourceType', type=str, help='which source [lyso, cesium, sodium, cobalt]')
+    parser.add_argument("--print-pdfs", default=None, dest='print_pdfs', type=str, help="Folder to save pdfs in.")
+    parser.add_argument('--channel-mask', type=lambda x: int(x,0), default=0xffffffff, help='channel mask')
+    parser.add_argument('-g', '--group', type=str, default=None, help='which group to analyze')
+    parser.add_argument('-s', '--slot', type=int, default=-1, help='which slot was the module in')
+    parser.add_argument('--ct', default=True, action='store_true', help='crosstalk analysis')
+    parser.add_argument('--ct-plt', default=False, action='store_true', help='plots crosstalk distributions')
+    args = parser.parse_args()
+
+    
+    calib_file = ROOT.TFile("/Users/albertodufour/Desktop/tesi/macros/master_calib.root", "READ")
+    #calib_file = ROOT.TFile("/home/cmsdaq/DAQ/qaqc_jig/macros/master_calib.root", "READ")
+    gMasterCalib_spe = None
+    gMasterCalib_lyso = None
+    print(args.slot,args.plot)
+    if args.slot >= 0:
+        gMasterCalib_spe = calib_file.Get("g_spe_slot%d"%args.slot)
+        gMasterCalib_lyso = calib_file.Get("g_lyso_slot%d"%args.slot)
+    
+    if not args.plot:
+        # Disables the canvas from ever popping up
+        gROOT.SetBatch()
+    
+
+    if args.print_pdfs:
+       print(args.print_pdfs)
+       if not os.path.exists(args.print_pdfs):
+       	  os.makedirs(args.print_pdfs)
+    
+    #------------------------------
+    # open hdf5 file with integrals
+    print("Opening hdf5 file...")
+    data = {}
+    ch_data = {}
+    source = None
+    with h5py.File(args.filename,'r') as f:
+        
+        for outer_key in f.keys():
+            ch_data[outer_key] = {}
+            group = f[outer_key]
+            for inner_key in group.keys():
+                ch_data[outer_key][inner_key] = group[inner_key][()]
+        
+        root_f = ROOT.TFile(args.output, "RECREATE")
+        
+        neighbors = {}
+        for i in range(32):
+            neighbors[i] = []
+            for j in range(i-2, i+3):
+                if j != i and j//8 == i//8:
+                    neighbors[i].append(j)
+        
+        group_charges = np.full(4, None)
+        trigger_charge = np.full(4, None)
+        # Loop over each trigger group
+        # 0: ch0-7
+        # 1: ch8-15
+        # 2: ch16-23
+        # 3: ch24-31
+        for i in range(4):
+            group_charges[i] = np.array([ch_data[f'ch{ch}'][f'lyso_charge'] for ch in range(8*i, 8*(i+1)) if f'ch{ch}' in ch_data])
+            if len(group_charges[i]) > 0:
+                trigger_charge[i] = np.max(group_charges[i], axis=0)
+        
+        zeroSuppression = 0
+
+        
+        ############################
+        # Source Histograms per bar
+        ############################
+        for ch in range(16):
+            channel1 = 'ch%s'%ch
+            channel2 = 'ch%s'%(31-ch)
+           
+            # Filling histogram
+            cut1 = np.percentile(trigger_charge[ch//8], 1)
+            cut2 = np.percentile(trigger_charge[(31-ch)//8], 1)
+            if f'lyso_charge' in ch_data[channel1] and f'lyso_charge' in ch_data[channel2]:
+                # It's important to remove crosstalk, especially for the LYSO
+                # spectra where we shouldn't see any gamma peaks from adjacent
+                # channels.
+                selection1 = np.array(ch_data[channel1][f'lyso_charge'] >= trigger_charge[ch//8]/2)
+                selection2 = np.array(ch_data[channel2][f'lyso_charge'] >= trigger_charge[(31-ch)//8]/2)
+                event_charges1 = ch_data[channel1][f'lyso_charge'][selection1 & selection2]
+                event_charges2 = ch_data[channel2][f'lyso_charge'][selection1 & selection2]
+                #event_charges1 = ch_data[channel1][f'lyso_charge']
+                #event_charges2 = ch_data[channel2][f'lyso_charge']
+                event_charges_raw = 0.5*(event_charges1+event_charges2)
+                if gMasterCalib_lyso is not None:
+                    event_charges = 0.5*(event_charges1*gMasterCalib_lyso.Eval(ch) + event_charges2*gMasterCalib_lyso.Eval(31-ch))
+                else:
+                    print("No LYSO calibration found; just using raw charges")
+                    event_charges = 0.5*(event_charges1 + event_charges2)
+                #source_bins = plot_utils.get_bins(event_charges, None)
+                #hsource = ROOT.TH1D(f"lyso_bar%02d"%ch, f"LYSO Charge Integral for ch%02d"%ch, int(1.*len(source_bins)), min(0,source_bins[0]), max(1400, source_bins[-1]))
+                #hsource_raw = ROOT.TH1D(f"lysoRaw_bar%02d"%ch, f"LYSO Charge Integral Raw for ch%02d"%ch, int(1.*len(source_bins)), min(0,source_bins[0]), max(1400, source_bins[-1]))
+                hsource = ROOT.TH1D(f"lyso_bar%02d"%ch, f"LYSO Charge Integral for bar%02d"%ch, 400, 0., 2000.)
+                hsource_raw = ROOT.TH1D(f"lyso_bar%02d_raw"%ch, f"LYSO Raw Charge Integral for bar%02d"%ch, 400, 0., 2000.)
+                for x in event_charges_raw:
+                    if x > zeroSuppression:
+                        hsource_raw.Fill(x)
+                for x in event_charges:
+                    if x > zeroSuppression:
+                        hsource.Fill(x)
+                hsource_raw.SetTitle(";Charge Raw (pC);entries")
+                hsource.SetTitle(";Charge (pC);entries")
+                
+                # Offset histogram, for measuring the pedestal
+                no_events1 = np.array(ch_data[channel1][f'lyso_charge'] < cut1)
+                no_events2 = np.array(ch_data[channel2][f'lyso_charge'] < cut2)
+                no_neighbor_events1 = np.full(len(ch_data[channel1][f'lyso_charge']), True)
+                no_neighbor_events2 = np.full(len(ch_data[channel2][f'lyso_charge']), True)
+                for neighbor in neighbors[ch]:
+                    if f'ch{neighbor}' in ch_data:
+                        no_neighbor_events1 = no_neighbor_events1 & np.array(ch_data[f'ch{neighbor}'][f'lyso_charge'] < cut1)
+                        no_neighbor_events2 = no_neighbor_events2 & np.array(ch_data[f'ch{neighbor}'][f'lyso_charge'] < cut2)
+                offset_selection = no_events1 & no_neighbor_events1 & no_events2 & no_neighbor_events2
+                offset_charges1 = ch_data[channel1][f'lyso_charge'][offset_selection]
+                offset_charges2 = ch_data[channel2][f'lyso_charge'][offset_selection]
+                if gMasterCalib_lyso is not None:
+                    offset_charges = 0.5*(offset_charges1*gMasterCalib_lyso.Eval(ch)+offset_charges2*gMasterCalib_lyso.Eval(31-ch))
+                else:
+                    print("No LYSO calibration found; just using raw charges")
+                    offset_charges = 0.5*(offset_charges1+offset_charges2)
+                offset_bins = plot_utils.get_bins(offset_charges)
+                #hoffset = ROOT.TH1D(f"lyso_bar%02d_pedestal"%ch, f"Pedestal LYSO Charge Integral for bar%02d"%ch, len(offset_bins), offset_bins[0], offset_bins[-1])
+                hoffset = ROOT.TH1D(f"lyso_bar%02d_pedestal"%ch, f"Pedestal LYSO Charge Integral for bar%02d"%ch, 400, -100., 300.)
+                for x in offset_charges:
+                    hoffset.Fill(x)
+                hoffset.SetTitle(";Charge (pC);entries")
+            
+            # Fitting offset Histogram
+            offset_pars = fit_gamma_funcs.fit_offset(hoffset) 
+            hoffset.Write()
+            if offset_pars is not None:
+                offset = offset_pars[0][0]
+                offset_sigma = offset_pars[0][1]
+            else:
+                print(f'WARNING: Could not measure the pedestal in ch{ch}. Defaulting to zero pedestal.')
+                offset = 0
+                offset_sigma = 10
+            
+            # Fitting source Histogram            
+            source_fit_pars_raw = None
+            source_fit_pars = None
+            if f'lyso_charge' in ch_data[channel1] and f'lyso_charge' in ch_data[channel2]:
+                if args.sourceType == 'lyso':
+                    print(f'Fitting LYSO bar{ch} for intrinsic spectrum...')
+                    source_fit_pars_raw = fit_intrinsic_funcs.fit_gamma(hsource_raw, SOURCES[args.sourceType], offset=offset, offset_sigma=offset_sigma)
+                    source_fit_pars = fit_intrinsic_funcs.fit_gamma(hsource, SOURCES[args.sourceType], offset=offset, offset_sigma=offset_sigma)
+                else:
+                    print(f'Fitting LYSO bar {ch} for source spectrum...')
+                    source_fit_pars_raw = fit_gamma_funcs.fit_gamma(hsource_raw, SOURCES[args.sourceType], offset=offset, offset_sigma=offset_sigma)
+                    source_fit_pars = fit_gamma_funcs.fit_gamma(hsource, SOURCES[args.sourceType], offset=offset, offset_sigma=offset_sigma)
+                hsource.Write()
+                hsource_raw.Write()
+                
+                new_item = {}
+                if source_fit_pars_raw is not None:
+                    new_item[f'lyso_fit_pars_raw'] = source_fit_pars_raw[0]
+                    new_item[f'lyso_fit_par_errors_raw'] = source_fit_pars_raw[1]
+                    new_item['pc_per_kev_raw'] = source_fit_pars_raw[0][0]
+                else:
+                    new_item[f'lyso_fit_pars_raw'] = None
+                    new_item[f'lyso_fit_par_errors_raw'] = None
+                    new_item['pc_per_kev_raw'] = None
+                if source_fit_pars is not None:
+                    new_item[f'lyso_fit_pars'] = source_fit_pars[0]
+                    new_item[f'lyso_fit_par_errors'] = source_fit_pars[1]
+                    new_item['pc_per_kev'] = source_fit_pars[0][0]
+                else:
+                    new_item[f'lyso_fit_pars'] = None
+                    new_item[f'lyso_fit_par_errors'] = None
+                    new_item['pc_per_kev'] = None
+                
+                ch_data['bar%d'%ch] = new_item
+                #plot_utils.plot_hist(hsource_raw, path=args.print_pdfs, filename=args.filename)        
+                plot_utils.plot_hist(hsource, path=args.print_pdfs, filename=args.filename)
+
+        
+        ########################
+        # Histograms per channel
+        ########################
+        for channel in sorted([item for item in ch_data if 'bar' not in item], key=lambda channel: int(channel[2:])):
+            ch = int(channel[2:])
+            
+            # Creating Histograms
+            cut = np.percentile(trigger_charge[ch//8], 1)
+            
+            if f'lyso_charge' in ch_data[channel]:
+                # It's important to remove crosstalk, especially for the LYSO
+                # spectra where we shouldn't see any gamma peaks from adjacent
+                # channels.
+                selection = np.array(ch_data[channel][f'lyso_charge'] >= trigger_charge[ch//8]/2)
+                event_charges_raw = ch_data[channel][f'lyso_charge'][selection]
+                if gMasterCalib_lyso is not None:
+                    event_charges = event_charges_raw * gMasterCalib_lyso.Eval(ch)
+                else:
+                    print("No LYSO calibration found; just using raw charges")
+                    event_charges = event_charges_raw
+                #source_bins = plot_utils.get_bins(event_charges, None)
+                #hsource_raw = ROOT.TH1D(f"lysoRaw_ch%02d"%ch, f"LYSO Raw Charge Integral for ch%02d"%ch, int(1.*len(source_bins)), min(0,source_bins[0]), max(1400,source_bins[-1]))
+                #hsource = ROOT.TH1D(f"lyso_ch%02d"%ch, f"LYSO Charge Integral for ch%02d"%ch, int(1.*len(source_bins)), min(0,source_bins[0]), max(1400,source_bins[-1]))
+                hsource_raw = ROOT.TH1D(f"lyso_ch%02d_raw"%ch, f"LYSO Raw Charge Integral for ch%02d"%ch, 400, 0., 2000.)
+                hsource = ROOT.TH1D(f"lyso_ch%02d"%ch, f"LYSO Charge Integral for ch%02d"%ch, 400, 0., 2000.)
+                for x in event_charges_raw:
+                    if x > zeroSuppression:
+                        hsource_raw.Fill(x)
+                for x in event_charges:
+                    if x > zeroSuppression:
+                        hsource.Fill(x)
+                hsource_raw.SetTitle(";Charge Raw (pC);entries")
+                hsource.SetTitle(";Charge (pC);entries")
+                
+                # Offset histogram, for measuring the pedestal
+                no_events = np.array(ch_data[channel][f'lyso_charge'] < cut)
+                no_neighbor_events = np.full(len(ch_data[channel][f'lyso_charge']), True)
+                for neighbor in neighbors[ch]:
+                    if f'ch{neighbor}' in ch_data:
+                        no_neighbor_events = no_neighbor_events & np.array(ch_data[f'ch{neighbor}'][f'lyso_charge'] < cut)
+                offset_selection = no_events & no_neighbor_events
+                offset_bins = plot_utils.get_bins(ch_data[channel][f'lyso_charge'][offset_selection])
+                hoffset = ROOT.TH1D(f"lyso_ch%02d_pedestal"%ch, f"Pedestal LYSO Charge Integral for ch%02d"%ch, len(offset_bins), offset_bins[0], offset_bins[-1])
+                for x in ch_data[channel][f"lyso_charge"][offset_selection]:
+                    hoffset.Fill(x)
+                hoffset.SetTitle(";Charge (pC);entries")
+                
+            if 'spe_charge' in ch_data[channel]:
+                #spe_bins = plot_utils.get_bins(ch_data[channel]['spe_charge'])
+                #hspe = ROOT.TH1D("spe_ch%02d" % ch, "SPE Charge Integral for ch%02d" % ch, len(spe_bins), spe_bins[0], spe_bins[-1])
+                hspe = ROOT.TH1D("spe_ch%02d" % ch, "SPE Charge Integral for ch%02d" % ch, 1000, -5., 20.)
+                if gMasterCalib_spe is not None:
+                    event_charges = ch_data[channel]['spe_charge'] * gMasterCalib_spe.Eval(ch)
+                else:
+                    print("No SPE calibration found; just using raw charges")
+                    event_charges = ch_data[channel]['spe_charge']
+                for x in event_charges:
+                    hspe.Fill(x)
+                hspe.SetTitle(";Charge (pC);entries")
+                
+                print('Fitting SPE %s!' % channel)
+                spe_fit_pars = None
+                #model = fit_spe_funcs.vinogradov_model()
+                #spe_fit_pars = fit_spe_funcs.fit_spe(hspe, model)
+                spe_fit_pars = fit_spe_funcs.fit_spe_tspectrum(hspe)
+                if spe_fit_pars is not None:
+                    ch_data[channel]['spe_fit_pars'] = spe_fit_pars[0]
+                    ch_data[channel]['spe_fit_par_errors'] = spe_fit_pars[1]
+                    ch_data[channel]['spe'] = spe_fit_pars[0][0]
+                else:
+                    ch_data[channel]['spe_fit_pars'] = None
+                    ch_data[channel]['spe_fit_par_errors'] = None
+                    ch_data[channel]['spe'] = None
+                plot_utils.plot_hist(hspe, path=args.print_pdfs, filename=args.filename, logy=True)
+                hspe.Write()
+                
+            # Fitting Histograms
+            offset_pars = fit_gamma_funcs.fit_offset(hoffset) 
+            hoffset.Write()
+            if offset_pars is not None:
+                offset = offset_pars[0][0]
+                offset_sigma = offset_pars[0][1]
+            else:
+                print(f'WARNING: Could not measure the pedestal in ch{ch}. Defaulting to zero pedestal.')
+                offset = 0
+                offset_sigma = 10
+            
+            source_fit_pars = None
+            if f'lyso_charge' in ch_data[channel]:
+                if args.sourceType == 'lyso':
+                    print(f'Fitting LYSO ch{ch} for intrinsic spectrum...')
+                    #if 'spe_charge' in ch_data[channel] and spe_fit_pars is not None:
+                    #    model = fit_lyso_funcs.lyso_spectrum(spe_charge=spe_fit_pars[0][0]/ATTENUATION_FACTOR, offset=offset)
+                    #else:
+                    #    model = fit_lyso_funcs.lyso_spectrum(offset=offset)
+                    #
+                    #if hsource.GetEntries() != 0:
+                    #    if ch in (7,8,23,24):
+                    #        # These channels are in the middle of a module and next
+                    #        # to an unpowered bar so we can't cut coincidences
+                    #        # properly, i.e. the charge distribution will have both
+                    #        # crosstalk and gammas from neighboring unpowered bars.
+                    #        # Therefore, we don't fix the gamma peak parameters
+                    #        # when doing these fits.
+                    #        source_fit_pars = fit_lyso_funcs.fit_lyso(hsource, model, fix_pars=False)
+                    #    else:
+                    #        source_fit_pars = fit_lyso_funcs.fit_lyso(hsource, model)
+                    source_fit_pars_raw = fit_intrinsic_funcs.fit_gamma(hsource_raw, SOURCES[args.sourceType], offset=offset, offset_sigma=offset_sigma)
+                    source_fit_pars = fit_intrinsic_funcs.fit_gamma(hsource, SOURCES[args.sourceType], offset=offset, offset_sigma=offset_sigma)                    
+                else:
+                    print(f'Fitting LYSO channel {ch} for source spectrum...')
+                    source_fit_pars_raw = fit_gamma_funcs.fit_gamma(hsource_raw, SOURCES[args.sourceType], offset=offset, offset_sigma=offset_sigma)
+                    source_fit_pars = fit_gamma_funcs.fit_gamma(hsource, SOURCES[args.sourceType], offset=offset, offset_sigma=offset_sigma)
+                hsource.Write()
+                
+                if source_fit_pars_raw is not None:
+                    ch_data[channel][f'lyso_fit_pars_raw'] = source_fit_pars_raw[0]
+                    ch_data[channel][f'lyso_fit_par_errors_raw'] = source_fit_pars_raw[1]
+                    ch_data[channel]['pc_per_kev_raw'] = source_fit_pars_raw[0][0]
+                else:
+                    ch_data[channel][f'lyso_fit_pars_raw'] = None
+                    ch_data[channel][f'lyso_fit_par_errors_raw'] = None
+                    ch_data[channel]['pc_per_kev_raw'] = None
+                if source_fit_pars is not None:
+                    ch_data[channel][f'lyso_fit_pars'] = source_fit_pars[0]
+                    ch_data[channel][f'lyso_fit_par_errors'] = source_fit_pars[1]
+                    ch_data[channel]['pc_per_kev'] = source_fit_pars[0][0]
+                else:
+                    ch_data[channel][f'lyso_fit_pars'] = None
+                    ch_data[channel][f'lyso_fit_par_errors'] = None
+                    ch_data[channel]['pc_per_kev'] = None                    
+                plot_utils.plot_hist(hsource, path=args.print_pdfs, filename=args.filename)
+
+
+            ####################
+            # CROSSTALK (alberto)
+            ####################
+            # crosstalk defined as:
+            # (charge per channel) / (sum of charges in the charge group) = [ct] / [ct_tot]
+
+            # CROSSTALK SELECTION
+            # Selecting photoelectric events (within 0.5 sigma from the 511keV peak):
+            # avoids bias from 511 keV Compton.
+            # NOTE: does not solve 1275keV Compton bias
+            if args.ct:
+                ct_threshold = {}
+                ct_threshold['low'] = 511 * (ch_data[channel][f'lyso_fit_pars'][0] - 0.5 * ch_data[channel][f'lyso_fit_pars'][1])
+                ct_threshold['high'] = 511 * (ch_data[channel][f'lyso_fit_pars'][0] + 0.5 * ch_data[channel][f'lyso_fit_pars'][1])
+                
+                ct_selection = np.array(ch_data[channel][f'lyso_charge'] >= ct_threshold['low']) & (ch_data[channel][f'lyso_charge'] <= ct_threshold['high']) 
+                
+                ch_data[channel]['ct'] = {}
+                ch_data[channel]['ct_ratio'] = {}
+                ch_data[channel]['ct_tot'] = {}
+                ch_data[channel]['ct_tot'][f"group_{ch//8}"] = np.zeros(np.sum(ct_selection))
+
+                for ct_ch in range(8*(ch//8) , 8*(ch//8 + 1)):
+                    if f'ch{ct_ch}' in ch_data:
+                        # apply calibration
+                        if gMasterCalib_lyso is not None:
+                            ch_data[channel]['ct'][f'ct_ch{ct_ch}'] = ch_data[f'ch{ct_ch}'][f'lyso_charge'][ct_selection] * gMasterCalib_lyso.Eval(ct_ch)
+                        else:
+                            print("No LYSO calibration found; just using raw charges for CT")
+                            ch_data[channel]['ct'][f'ct_ch{ct_ch}'] = ch_data[f'ch{ct_ch}'][f'lyso_charge'][ct_selection]
+
+                        ch_data[channel]['ct_tot'][f"group_{ch//8}"] =  np.array([
+                                x + y for x, y in zip(
+                                    ch_data[channel]['ct_tot'][f'group_{ch//8}'],
+                                    ch_data[channel]['ct'][f'ct_ch{ct_ch}']
+                                    )
+                                ])
+                for ct_ch in range(8*(ch//8) , 8*(ch//8 + 1)):       
+                    ch_data[channel]['ct_ratio'][f'ct_ch{ct_ch}'] = ch_data[channel]['ct'][f'ct_ch{ct_ch}'] / ch_data[channel]['ct_tot'][f"group_{ch//8}"]
+    
+            
+    ##################
+    # Reviewing Data
+    ##################
+    success_spe = np.full(32, True)
+    success_lyso = np.full(32, True)
+    for channel in sorted([item for item in ch_data if 'bar' not in item], key=lambda channel: int(channel[2:])):
+        if 'pc_per_kev' not in ch_data[channel]:
+            print('Missing source data for %s!' % channel)
+            success_lyso[int(channel[2:])] = False
+        if 'spe' not in ch_data[channel]:
+            print('Missing SPE data for %s!' % channel)
+            success_spe[int(channel[2:])] = False
+        if ch_data[channel]['pc_per_kev'] is None or ch_data[channel]['pc_per_kev']<=0 or ch_data[channel]['pc_per_kev']>10000:
+            print(f'Failed to fit {channel} lyso histogram!')
+            success_lyso[int(channel[2:])] = False
+        if ch_data[channel]['spe'] is None or ch_data[channel]['spe']<=0 or ch_data[channel]['spe']>1e5:
+            print('Failed to fit %s spe histogram!' % channel)
+            success_spe[int(channel[2:])] = False
+    
+
+
+    #############################
+    # CROSSTALK ANALYSIS (alberto)
+    #############################
+    
+    if args.ct:
+        #crosstalk histograms are stored in a subfolder
+        if args.ct_plt:
+            crosstalk_path = os.path.join(args.print_pdfs, 'crosstalk')  
+            if not os.path.exists(crosstalk_path):
+                os.makedirs(crosstalk_path)
+
+        # Studying crosstalk for nearest and second-nearest neighbors:
+        # selecting "central" channels only: avoids lyso edge bias
+        central_channels = [2,3,4,5,10,11,12,13,18,19,20,21,26,27,28,29]
+
+        # Fitting ct_ratio and building CT graphs
+        ct_matrix = {}
+        ct_matrix['mean'] = np.full((32, 32), 0.0)
+        ct_matrix['sigma'] = np.full((32, 32), 0.0)
+
+
+        for channel in [f"ch{ch}" for ch in central_channels]:
+            ch = int(channel[2:])
+            print(f"Fitting crosstalk histograms for ch{ch}...\n")
+            h_CT = ROOT.TH1D(f"h_CT_ch{ch}_ctch{ch}", f"CT for ch{ch}: ct_ch{ch}", 100, 0.0, 1.0)
+            
+            #fitting "main" crosstalk channel
+            for x in ch_data[channel]['ct_ratio'][f'ct_ch{ch}']:
+                h_CT.Fill(x)
+            fit_result = crosstalk_utils.fit_ct_ratio(h_CT)
+            if fit_result != None:
+                ct_matrix['mean'][ch][ch] = fit_result[0][1]
+                ct_matrix['sigma'][ch][ch] = fit_result[0][2]
+            else:
+                print(f"Crosstalk fitting failed for ch{ch} : ct_ch{ch}")
+            if args.ct_plt:
+                plot_utils.plot_hist(h_CT, path=crosstalk_path, filename=args.filename)
+            
+            #fitting neighbors crosstalk channels
+            for nbr in neighbors[ch]:
+                if abs(ch-nbr)<=2:
+                    h_CT = ROOT.TH1D(f"h_CT_ch{ch}_ctch{nbr}", f"CT for ch{ch}: ct_ch{nbr}", 100, 0.0, 1.0)
+                    for x in ch_data[channel]['ct_ratio'][f'ct_ch{nbr}']:
+                        h_CT.Fill(x)
+                    fit_result = crosstalk_utils.fit_ct_ratio(h_CT)
+                    if fit_result != None:
+                        ct_matrix['mean'][ch][nbr] = fit_result[0][1]
+                        ct_matrix['sigma'][ch][nbr] = fit_result[0][2]
+                    else:
+                        print(f"Crosstalk fitting failed for ch{ch} : ct_ch{nbr}")
+                    if args.ct_plt:
+                        plot_utils.plot_hist(h_CT, path=crosstalk_path, filename=args.filename)
+
+
+        g_CT_L = ROOT.TGraphErrors()
+        g_CT_R = ROOT.TGraphErrors()
+        g_avg_CT = ROOT.TGraphErrors()
+
+        for channel in [f"ch{ch}" for ch in central_channels]:
+            ch = int(channel[2:])
+            
+            if ch < 16:
+                
+                g_CT_L.SetPoint(g_CT_L.GetN(), ch, 1 - ct_matrix['mean'][ch][ch])
+                g_CT_L.SetPointError(g_CT_L.GetN()-1, 0, ct_matrix['sigma'][ch][ch])
+                g_CT_R.SetPoint(g_CT_R.GetN(), ch, 1 - ct_matrix['mean'][31-ch][31-ch])
+                g_CT_R.SetPointError(g_CT_R.GetN()-1, 0, ct_matrix['sigma'][31-ch][31-ch])
+
+                g_avg_CT.SetPoint(g_avg_CT.GetN(), ch, 1 - 0.5 * (ct_matrix['mean'][ch][ch]+ct_matrix['mean'][31-ch][31-ch] ))
+                g_avg_CT.SetPointError(g_avg_CT.GetN()-1, 0, 0.5 * np.sqrt((ct_matrix['sigma'][ch][ch]*ct_matrix['sigma'][ch][ch] + ct_matrix['sigma'][31-ch][31-ch] * ct_matrix['sigma'][31-ch][31-ch] )))
+
+        g_avg_CT.SetName("g_avg_CT")
+        g_avg_CT.SetTitle("Average crosstalk; Bar ID; crosstalk")
+        g_CT_L.SetTitle("Average crosstalk; Bar ID; crosstalk")
+        g_CT_R.SetTitle("Average crosstalk; Bar ID; crosstalk")
+        g_avg_CT.Write()
+
+        print(f"\n\nPrinting g_avg_CT in {args.print_pdfs}\n\n")
+        plot_utils.plot_graph_bars(g_CT_L, g_CT_R, g_avg_CT, path=args.print_pdfs, filename=args.filename, graphname="g_avg_CT", yMin=0., yMax=1.)
+
+
+        #Crosstalk asymmetry:  0.5 * (ch(+1) - ch(-1))/ (ch(+1) + ch(-1))
+        g_CT_asymm_L = ROOT.TGraphErrors()
+        g_CT_asymm_R = ROOT.TGraphErrors()
+        g_avg_CT_asymm = ROOT.TGraphErrors()
+        asymm = {}
+        for ch in np.array(central_channels)[np.array(central_channels) < 16]:
+            
+            if ch-1 in neighbors[ch] and ch+1 in neighbors[ch]:
+                if ct_matrix['mean'][ch][ch-1] != None and ct_matrix['mean'][ch][ch+1] != None:
+                    asymm['val'] = 0.5 * (ct_matrix['mean'][ch][ch+1] - ct_matrix['mean'][ch][ch-1]) / (ct_matrix['mean'][ch][ch+1] + ct_matrix['mean'][ch][ch-1])
+                    asymm['sigma'] = 0.5 * np.sqrt(ct_matrix['mean'][ch][ch+1]*ct_matrix['mean'][ch][ch+1] * ct_matrix['sigma'][ch][ch-1]*ct_matrix['sigma'][ch][ch-1] +
+                                            ct_matrix['mean'][ch][ch-1]*ct_matrix['mean'][ch][ch-1] * ct_matrix['sigma'][ch][ch+1]*ct_matrix['sigma'][ch][ch+1] ) * 1 / ( (ct_matrix['mean'][ch][ch+1] + ct_matrix['mean'][ch][ch-1]) * (ct_matrix['mean'][ch][ch+1] + ct_matrix['mean'][ch][ch-1]) )
+                    g_CT_asymm_L.SetPoint(g_CT_asymm_L.GetN(), ch, asymm['val'])
+                    g_CT_asymm_L.SetPointError(g_CT_asymm_L.GetN()-1, 0 , asymm['sigma'])
+            
+            if 31-ch-1 in neighbors[31-ch] and 31-ch+1 in neighbors[31-ch]:
+                if ct_matrix['mean'][31-ch][31-ch-1] != None and ct_matrix['mean'][31-ch][31-ch+1] != None:
+                    asymm['val'] = 0.5 * (ct_matrix['mean'][31-ch][31-ch+1] - ct_matrix['mean'][31-ch][31-ch-1]) / (ct_matrix['mean'][31-ch][31-ch+1] + ct_matrix['mean'][31-ch][31-ch-1])
+                    asymm['sigma'] = 0.5 * np.sqrt(ct_matrix['mean'][31-ch][31-ch+1]*ct_matrix['mean'][31-ch][31-ch+1] * ct_matrix['sigma'][31-ch][31-ch-1]*ct_matrix['sigma'][31-ch][31-ch-1] +
+                                            ct_matrix['mean'][31-ch][31-ch-1]*ct_matrix['mean'][31-ch][31-ch-1] * ct_matrix['sigma'][31-ch][31-ch+1]*ct_matrix['sigma'][31-ch][31-ch+1] ) * 1 / ( (ct_matrix['mean'][31-ch][31-ch+1] + ct_matrix['mean'][31-ch][31-ch-1]) * (ct_matrix['mean'][31-ch][31-ch+1] + ct_matrix['mean'][31-ch][31-ch-1]) )
+                    g_CT_asymm_R.SetPoint(g_CT_asymm_R.GetN(), ch, asymm['val'])
+                    g_CT_asymm_R.SetPointError(g_CT_asymm_R.GetN()-1, 0 , asymm['sigma'])
+            
+            
+        
+        g_CT_asymm_L.SetTitle("Crosstalk asymmetry; Bar ID; ct asymmetry")
+        g_CT_asymm_L.SetTitle("Crosstalk asymmetry; Bar ID; ct asymmetry")
+        g_avg_CT_asymm.SetName("g_CT_asymm")
+        g_avg_CT_asymm.Write()
+        plot_utils.plot_graph_bars(g_CT_asymm_L, g_CT_asymm_R, g_avg_CT_asymm, path=args.print_pdfs, filename=args.filename, graphname="g_avg_CT_asymm", yMin=-0.5, yMax=0.5)
+
+
+    ##################
+    # Making Plots
+    ##################
+    
+    #average of left and right
+    g_avg_lyso_pc_per_kev_raw_vs_bar = ROOT.TGraphErrors()
+    g_avg_lyso_pc_per_kev_vs_bar = ROOT.TGraphErrors()
+    g_avg_lyso_res_vs_bar = ROOT.TGraphErrors()
+    g_avg_lyso_counts_vs_bar = ROOT.TGraphErrors()
+    g_avg_light_yield_vs_bar = ROOT.TGraphErrors()
+    g_avg_spe_vs_bar = ROOT.TGraphErrors()
+    
+    for channel in sorted([item for item in ch_data if 'bar' in item], key=lambda channel: int(channel[3:])):
+        ch1 = int(channel[3:])
+        ch2 = 31 - ch1
+        #if not (success[ch1] and success[ch2]):
+        #    continue
+        #if ch_data[channel][f'lyso_fit_pars'] is None:
+        #    print('Failed to fit bar%d lyso histogram'%ch1)
+        #    continue
+        source_fit_pars_raw = ch_data[channel][f'lyso_fit_pars_raw']
+        source_fit_par_errors_raw = ch_data[channel][f'lyso_fit_par_errors_raw']        
+        source_fit_pars = ch_data[channel][f'lyso_fit_pars']
+        source_fit_par_errors = ch_data[channel][f'lyso_fit_par_errors']
+        spe_fit_pars1 = ch_data['ch%d'%ch1]['spe_fit_pars']
+        spe_fit_pars2 = ch_data['ch%d'%ch2]['spe_fit_pars']
+        spe_fit_par_errors1 = ch_data['ch%d'%ch1]['spe_fit_par_errors']
+        spe_fit_par_errors2 = ch_data['ch%d'%ch2]['spe_fit_par_errors']
+        
+        if source_fit_pars_raw is not None:
+            g_avg_lyso_pc_per_kev_raw_vs_bar.SetPoint(g_avg_lyso_pc_per_kev_raw_vs_bar.GetN(),ch1,source_fit_pars_raw[0])
+            g_avg_lyso_pc_per_kev_raw_vs_bar.SetPointError(g_avg_lyso_pc_per_kev_raw_vs_bar.GetN()-1,0.,source_fit_par_errors_raw[0])
+        
+        if source_fit_pars is not None:
+            g_avg_lyso_pc_per_kev_vs_bar.SetPoint(g_avg_lyso_pc_per_kev_vs_bar.GetN(),ch1,source_fit_pars[0])
+            g_avg_lyso_pc_per_kev_vs_bar.SetPointError(g_avg_lyso_pc_per_kev_vs_bar.GetN()-1,0.,source_fit_par_errors[0])
+            
+            g_avg_lyso_res_vs_bar.SetPoint(g_avg_lyso_res_vs_bar.GetN(),ch1,source_fit_pars[1]/source_fit_pars[0])
+            g_avg_lyso_res_vs_bar.SetPointError(g_avg_lyso_res_vs_bar.GetN()-1,0.,source_fit_par_errors[1]/source_fit_pars[0])
+            
+            g_avg_lyso_counts_vs_bar.SetPoint(g_avg_lyso_counts_vs_bar.GetN(),ch1,source_fit_pars[2])
+            g_avg_lyso_counts_vs_bar.SetPointError(g_avg_lyso_counts_vs_bar.GetN()-1,0.,source_fit_par_errors[2])
+        
+        if spe_fit_pars1 is not None and spe_fit_pars2 is not None:
+            g_avg_spe_vs_bar.SetPoint(g_avg_spe_vs_bar.GetN(),ch1,0.5*(spe_fit_pars1[0]+spe_fit_pars2[0]))
+            g_avg_spe_vs_bar.SetPointError(g_avg_spe_vs_bar.GetN()-1,0.,0.5*math.sqrt(spe_fit_par_errors1[0]**2+spe_fit_par_errors2[0]**2))
+
+        print(ch1,source_fit_pars,spe_fit_pars1,spe_fit_pars2)
+        if source_fit_pars is not None and spe_fit_pars1 is not None and spe_fit_pars2 is not None:
+            LY = source_fit_pars[0]*ATTENUATION_FACTOR*1000/(0.5*(spe_fit_pars1[0]+spe_fit_pars2[0]))
+            dsource = source_fit_par_errors[0]/source_fit_pars[0]
+            dspe = 0.5 * np.sqrt(spe_fit_par_errors1[0]**2+spe_fit_par_errors2[0]**2)/(0.5*(spe_fit_pars1[0]+spe_fit_pars2[0]))
+            dtotal = np.sqrt(dsource**2 + dspe**2)
+            g_avg_light_yield_vs_bar.SetPoint(g_avg_light_yield_vs_bar.GetN(),ch1,LY)
+            g_avg_light_yield_vs_bar.SetPointError(g_avg_light_yield_vs_bar.GetN()-1,0.,LY*dtotal)
+
+            
+    g_avg_lyso_pc_per_kev_raw_vs_bar.SetTitle(f"LYSO Fit Results; Bar ID; Raw Integrated Charge (pC/keV)")
+    g_avg_lyso_pc_per_kev_raw_vs_bar.SetName("g_avg_lyso_pc_per_kev_raw_vs_bar")
+    g_avg_lyso_pc_per_kev_raw_vs_bar.Write()
+    
+    g_avg_lyso_pc_per_kev_vs_bar.SetTitle(f"LYSO Fit Results; Bar ID; Integrated Charge (pC/keV)")
+    g_avg_lyso_pc_per_kev_vs_bar.SetName("g_avg_lyso_pc_per_kev_vs_bar")
+    g_avg_lyso_pc_per_kev_vs_bar.Write()
+    
+    g_avg_lyso_res_vs_bar.SetTitle(f"LYSO Fit Results; Bar ID; Energy resolution")
+    g_avg_lyso_res_vs_bar.SetName("g_avg_lyso_res_vs_bar")
+    g_avg_lyso_res_vs_bar.Write()
+    
+    g_avg_lyso_counts_vs_bar.SetTitle(f"LYSO Fit Results; Bar ID; Counts at photopeak")
+    g_avg_lyso_counts_vs_bar.SetName("g_avg_lyso_counts_vs_bar")
+    g_avg_lyso_counts_vs_bar.Write()
+
+    g_avg_spe_vs_bar.SetTitle("SPE Fit Results; Bar ID; SPE Charge (pC)")
+    g_avg_spe_vs_bar.SetName("g_avg_spe_vs_bar")
+    g_avg_spe_vs_bar.Write()
+    
+    g_avg_light_yield_vs_bar.SetTitle("Light Yield; Bar ID; Light yield (p.e./MeV)")
+    g_avg_light_yield_vs_bar.SetName("g_avg_light_yield_vs_bar")
+    g_avg_light_yield_vs_bar.Write()
+    
+    
+    #single channels
+    g_lyso_pc_per_kev_raw_vs_ch = ROOT.TGraphErrors()
+    g_lyso_pc_per_kev_vs_ch = ROOT.TGraphErrors()
+    g_lyso_res_vs_ch = ROOT.TGraphErrors()
+    g_lyso_counts_vs_ch = ROOT.TGraphErrors()
+    g_spe_vs_ch = ROOT.TGraphErrors()
+    g_light_yield_vs_ch = ROOT.TGraphErrors()
+    
+    g_L_lyso_pc_per_kev_raw_vs_bar = ROOT.TGraphErrors()
+    g_L_lyso_pc_per_kev_vs_bar = ROOT.TGraphErrors()
+    g_L_lyso_res_vs_bar = ROOT.TGraphErrors()
+    g_L_lyso_counts_vs_bar = ROOT.TGraphErrors()
+    g_L_spe_vs_bar = ROOT.TGraphErrors()
+    g_L_light_yield_vs_bar = ROOT.TGraphErrors()
+    
+    g_R_lyso_pc_per_kev_raw_vs_bar = ROOT.TGraphErrors()
+    g_R_lyso_pc_per_kev_vs_bar = ROOT.TGraphErrors()
+    g_R_lyso_res_vs_bar = ROOT.TGraphErrors()
+    g_R_lyso_counts_vs_bar = ROOT.TGraphErrors()
+    g_R_spe_vs_bar = ROOT.TGraphErrors()
+    g_R_light_yield_vs_bar = ROOT.TGraphErrors()
+    
+    g_light_yield_asymm_vs_bar = ROOT.TGraphErrors()
+    
+    for channel in sorted([item for item in ch_data if 'bar' not in item], key=lambda channel: int(channel[2:])):
+        ch = int(channel[2:])
+        #if not success[ch]:
+        #    continue
+        source_fit_pars_raw = ch_data[channel][f'lyso_fit_pars_raw']
+        source_fit_par_errors_raw = ch_data[channel][f'lyso_fit_par_errors_raw']
+        source_fit_pars = ch_data[channel][f'lyso_fit_pars']
+        source_fit_par_errors = ch_data[channel][f'lyso_fit_par_errors']        
+        spe_fit_pars = ch_data[channel]['spe_fit_pars']
+        spe_fit_par_errors = ch_data[channel]['spe_fit_par_errors']
+        
+        if source_fit_pars_raw is not None:
+            g_lyso_pc_per_kev_raw_vs_ch.SetPoint(g_lyso_pc_per_kev_raw_vs_ch.GetN(),ch,source_fit_pars_raw[0])
+            g_lyso_pc_per_kev_raw_vs_ch.SetPointError(g_lyso_pc_per_kev_raw_vs_ch.GetN()-1,0.,source_fit_par_errors_raw[0])
+            if ch < 16:
+                g_L_lyso_pc_per_kev_raw_vs_bar.SetPoint(g_L_lyso_pc_per_kev_raw_vs_bar.GetN(),ch,source_fit_pars_raw[0])
+                g_L_lyso_pc_per_kev_raw_vs_bar.SetPointError(g_L_lyso_pc_per_kev_raw_vs_bar.GetN()-1,0.,source_fit_par_errors_raw[0])
+            else:
+                g_R_lyso_pc_per_kev_raw_vs_bar.SetPoint(g_R_lyso_pc_per_kev_raw_vs_bar.GetN(),31-ch,source_fit_pars_raw[0])
+                g_R_lyso_pc_per_kev_raw_vs_bar.SetPointError(g_R_lyso_pc_per_kev_raw_vs_bar.GetN()-1,0.,source_fit_par_errors_raw[0])                
+        
+        if source_fit_pars is not None:
+            g_lyso_pc_per_kev_vs_ch.SetPoint(g_lyso_pc_per_kev_vs_ch.GetN(),ch,source_fit_pars[0])
+            g_lyso_pc_per_kev_vs_ch.SetPointError(g_lyso_pc_per_kev_vs_ch.GetN()-1,0.,source_fit_par_errors[0])
+            
+            g_lyso_res_vs_ch.SetPoint(g_lyso_res_vs_ch.GetN(),ch,source_fit_pars[1]/source_fit_pars[0])
+            g_lyso_res_vs_ch.SetPointError(g_lyso_res_vs_ch.GetN()-1,0.,source_fit_par_errors[1]/source_fit_pars[0])
+            
+            g_lyso_counts_vs_ch.SetPoint(g_lyso_counts_vs_ch.GetN(),ch,source_fit_pars[2])
+            g_lyso_counts_vs_ch.SetPointError(g_lyso_counts_vs_ch.GetN()-1,0.,source_fit_par_errors[2])
+
+            if ch < 16:
+                g_L_lyso_pc_per_kev_vs_bar.SetPoint(g_L_lyso_pc_per_kev_vs_bar.GetN(),ch,source_fit_pars[0])
+                g_L_lyso_pc_per_kev_vs_bar.SetPointError(g_L_lyso_pc_per_kev_vs_bar.GetN()-1,0.,source_fit_par_errors[0])
+                
+                g_L_lyso_res_vs_bar.SetPoint(g_L_lyso_res_vs_bar.GetN(),ch,source_fit_pars[1]/source_fit_pars[0])
+                g_L_lyso_res_vs_bar.SetPointError(g_L_lyso_res_vs_bar.GetN()-1,0.,source_fit_par_errors[1]/source_fit_pars[0])
+                
+                g_L_lyso_counts_vs_bar.SetPoint(g_L_lyso_counts_vs_bar.GetN(),ch,source_fit_pars[2])
+                g_L_lyso_counts_vs_bar.SetPointError(g_L_lyso_counts_vs_bar.GetN()-1,0.,source_fit_par_errors[2])
+            else:
+                g_R_lyso_pc_per_kev_vs_bar.SetPoint(g_R_lyso_pc_per_kev_vs_bar.GetN(),31-ch,source_fit_pars[0])
+                g_R_lyso_pc_per_kev_vs_bar.SetPointError(g_R_lyso_pc_per_kev_vs_bar.GetN()-1,0.,source_fit_par_errors[0])
+                
+                g_R_lyso_res_vs_bar.SetPoint(g_R_lyso_res_vs_bar.GetN(),31-ch,source_fit_pars[1]/source_fit_pars[0])
+                g_R_lyso_res_vs_bar.SetPointError(g_R_lyso_res_vs_bar.GetN()-1,0.,source_fit_par_errors[1]/source_fit_pars[0])
+                
+                g_R_lyso_counts_vs_bar.SetPoint(g_R_lyso_counts_vs_bar.GetN(),31-ch,source_fit_pars[2])
+                g_R_lyso_counts_vs_bar.SetPointError(g_R_lyso_counts_vs_bar.GetN()-1,0.,source_fit_par_errors[2])
+            
+        if spe_fit_pars is not None:
+            g_spe_vs_ch.SetPoint(g_spe_vs_ch.GetN(),ch,spe_fit_pars[0])
+            g_spe_vs_ch.SetPointError(g_spe_vs_ch.GetN()-1,0.,spe_fit_par_errors[0])
+            if ch < 16:
+                g_L_spe_vs_bar.SetPoint(g_L_spe_vs_bar.GetN(),ch,spe_fit_pars[0])
+                g_L_spe_vs_bar.SetPointError(g_L_spe_vs_bar.GetN()-1,0.,spe_fit_par_errors[0])
+            else:
+                g_R_spe_vs_bar.SetPoint(g_R_spe_vs_bar.GetN(),31-ch,spe_fit_pars[0])
+                g_R_spe_vs_bar.SetPointError(g_R_spe_vs_bar.GetN()-1,0.,spe_fit_par_errors[0])
+        
+        if source_fit_pars is not None and spe_fit_pars is not None:
+            LY = source_fit_pars[0]*ATTENUATION_FACTOR*1000/spe_fit_pars[0]
+            dsource = source_fit_par_errors[0]/source_fit_pars[0]
+            dspe = spe_fit_par_errors[0]/spe_fit_pars[0]
+            dtotal = np.sqrt(dsource**2 + dspe**2)
+            g_light_yield_vs_ch.SetPoint(g_light_yield_vs_ch.GetN(),ch,LY)
+            g_light_yield_vs_ch.SetPointError(g_light_yield_vs_ch.GetN()-1,0.,LY*dtotal)
+            if ch < 16:
+                g_L_light_yield_vs_bar.SetPoint(g_L_light_yield_vs_bar.GetN(),ch,LY)
+                g_L_light_yield_vs_bar.SetPointError(g_L_light_yield_vs_bar.GetN()-1,0.,LY*dtotal)
+            else:
+                g_R_light_yield_vs_bar.SetPoint(g_R_light_yield_vs_bar.GetN(),31-ch,LY)
+                g_R_light_yield_vs_bar.SetPointError(g_R_light_yield_vs_bar.GetN()-1,0.,LY*dtotal)
+            
+    g_lyso_pc_per_kev_raw_vs_ch.SetTitle(f"LYSO Fit Results; Channel; Raw Integrated Charge (pC/keV)")
+    g_lyso_pc_per_kev_raw_vs_ch.SetName("g_lyso_pc_per_kev_raw_vs_ch")
+    g_lyso_pc_per_kev_raw_vs_ch.Write()
+    plot_utils.plot_graph(g_lyso_pc_per_kev_raw_vs_ch, path=args.print_pdfs, filename=args.filename, yMin=0., yMax=4.)
+    
+    g_lyso_pc_per_kev_vs_ch.SetTitle(f"LYSO Fit Results; Channel; Raw Integrated Charge (pC/keV)")
+    g_lyso_pc_per_kev_vs_ch.SetName("g_lyso_pc_per_kev_vs_ch")
+    g_lyso_pc_per_kev_vs_ch.Write()
+    plot_utils.plot_graph(g_lyso_pc_per_kev_vs_ch, path=args.print_pdfs, filename=args.filename, yMin=0., yMax=3.)
+        
+    g_spe_vs_ch.SetTitle("SPE Fit Results; Channel; SPE Charge (pC)")
+    g_spe_vs_ch.SetName("g_spe_vs_ch")
+    g_spe_vs_ch.Write()
+    plot_utils.plot_graph(g_spe_vs_ch, path=args.print_pdfs, filename=args.filename, yMin=0., yMax=8.)
+    
+    g_light_yield_vs_ch.SetTitle("Light Yield; Channel; Light Yield (p.e./MeV)")
+    g_light_yield_vs_ch.SetName("g_light_yield_vs_ch")
+    g_light_yield_vs_ch.Write()
+    plot_utils.plot_graph(g_light_yield_vs_ch, path=args.print_pdfs, filename=args.filename, yMin=0., yMax=6000.)
+    
+    
+    #plots vs bar
+    g_L_lyso_pc_per_kev_raw_vs_bar.SetTitle(f"LYSO Fit Results; Bar ID; Integrated charge (pC/keV)")
+    g_L_lyso_pc_per_kev_raw_vs_bar.SetName("g_lyso_L_pc_per_kev_raw_vs_bar")
+    g_L_lyso_pc_per_kev_raw_vs_bar.Write()
+    g_R_lyso_pc_per_kev_raw_vs_bar.SetTitle(f"LYSO Fit Results; Bar ID; Integrated charge (pC/keV)")
+    g_R_lyso_pc_per_kev_raw_vs_bar.SetName("g_lyso_R_pc_per_kev_raw_vs_bar")
+    g_R_lyso_pc_per_kev_raw_vs_bar.Write()    
+    plot_utils.plot_graph_bars(g_L_lyso_pc_per_kev_raw_vs_bar, g_R_lyso_pc_per_kev_raw_vs_bar, g_avg_lyso_pc_per_kev_raw_vs_bar, path=args.print_pdfs, filename=args.filename, graphname='g_lyso_pc_per_kev_raw_vs_bar', yMin=0., yMax=4.)
+    
+    g_L_lyso_pc_per_kev_vs_bar.SetTitle(f"LYSO Fit Results; Bar ID; Integrated charge (pC/keV)")
+    g_L_lyso_pc_per_kev_vs_bar.SetName("g_lyso_L_pc_per_kev_vs_bar")
+    g_L_lyso_pc_per_kev_vs_bar.Write()
+    g_R_lyso_pc_per_kev_vs_bar.SetTitle(f"LYSO Fit Results; Bar ID; Integrated charge (pC/keV)")
+    g_R_lyso_pc_per_kev_vs_bar.SetName("g_lyso_R_pc_per_kev_vs_bar")
+    g_R_lyso_pc_per_kev_vs_bar.Write()    
+    plot_utils.plot_graph_bars(g_L_lyso_pc_per_kev_vs_bar, g_R_lyso_pc_per_kev_vs_bar, g_avg_lyso_pc_per_kev_vs_bar, path=args.print_pdfs, filename=args.filename, graphname='g_lyso_pc_per_kev_vs_bar', yMin=0., yMax=4.)
+    
+    g_L_lyso_res_vs_bar.SetTitle(f"LYSO Fit Results; Bar ID; Energy resolution")
+    g_L_lyso_res_vs_bar.SetName("g_lyso_L_peak_res_vs_bar")
+    g_L_lyso_res_vs_bar.Write()
+    g_R_lyso_res_vs_bar.SetTitle(f"LYSO Fit Results; Bar ID; Energy resolution")
+    g_R_lyso_res_vs_bar.SetName("g_lyso_R_peak_res_vs_bar")
+    g_R_lyso_res_vs_bar.Write()
+    plot_utils.plot_graph_bars(g_L_lyso_res_vs_bar, g_R_lyso_res_vs_bar, g_avg_lyso_res_vs_bar, path=args.print_pdfs, filename=args.filename, graphname='g_lyso_res_vs_bar', yMin=0., yMax=0.3)
+    
+    g_L_lyso_counts_vs_bar.SetTitle(f"LYSO Fit Results; Bar ID; Counts at photopeak")
+    g_L_lyso_counts_vs_bar.SetName("g_lyso_L_peak_counts_vs_bar")
+    g_L_lyso_counts_vs_bar.Write()
+    g_R_lyso_counts_vs_bar.SetTitle(f"LYSO Fit Results; Bar ID; Counts at photopeak")
+    g_R_lyso_counts_vs_bar.SetName("g_lyso_R_peak_counts_vs_bar")
+    g_R_lyso_counts_vs_bar.Write()
+    plot_utils.plot_graph_bars(g_L_lyso_counts_vs_bar, g_R_lyso_counts_vs_bar, g_avg_lyso_counts_vs_bar, path=args.print_pdfs, filename=args.filename, graphname='g_lyso_counts_vs_bar', yMin=0., yMax=1000.)
+    
+    g_L_spe_vs_bar.SetTitle(f"SPE Fit Results; Bar ID; SPE Charge (pC)")
+    g_L_spe_vs_bar.SetName("g_spe_L_vs_bar")
+    g_L_spe_vs_bar.Write()
+    g_R_spe_vs_bar.SetTitle(f"SPE Fit Results; Bar ID; SPE Charge (pC)")
+    g_R_spe_vs_bar.SetName("g_spe_R_vs_bar")
+    g_R_spe_vs_bar.Write()    
+    plot_utils.plot_graph_bars(g_L_spe_vs_bar, g_R_spe_vs_bar, g_avg_spe_vs_bar, path=args.print_pdfs, filename=args.filename, graphname='g_spe_vs_bar', yMin=0., yMax=8.)
+    
+    g_L_light_yield_vs_bar.SetTitle(f"Light Yield; Bar ID; Light Yield (p.e./MeV)")
+    g_L_light_yield_vs_bar.SetName("g_L_light_yield_vs_bar")
+    g_L_light_yield_vs_bar.Write()
+    g_R_light_yield_vs_bar.SetTitle(f"Light Yield; Bar ID; Light Yield (p.e./MeV)")
+    g_R_light_yield_vs_bar.SetName("g_R_light_yield_vs_bar")
+    g_R_light_yield_vs_bar.Write()
+    plot_utils.plot_graph_bars(g_L_light_yield_vs_bar, g_R_light_yield_vs_bar, g_avg_light_yield_vs_bar, path=args.print_pdfs, filename=args.filename, graphname='g_light_yield_vs_bar', yMin=0., yMax=6000.)
+    
+    for ibar in range(16):
+        LY_L = plot_utils.GetBarValue(g_L_light_yield_vs_bar,ibar)
+        LY_R = plot_utils.GetBarValue(g_R_light_yield_vs_bar,ibar)
+        if LY_L < 0. or LY_R < 0.:
+            continue
+        asymm = 2. * (LY_L-LY_R)/(LY_L+LY_R)
+        g_light_yield_asymm_vs_bar.SetPoint(g_light_yield_asymm_vs_bar.GetN(),ibar,asymm)
+    g_light_yield_asymm_vs_bar.SetTitle(f"Light Yield asymm.;Bar ID; asymmetry")
+    g_light_yield_asymm_vs_bar.SetName("g_light_yield_asymm_vs_bar")
+    g_light_yield_asymm_vs_bar.Write()
+    plot_utils.plot_graph(g_light_yield_asymm_vs_bar, path=args.print_pdfs, filename=args.filename, xMax=16., yMin=-0.5, yMax=0.5)
+    
+    
+
+    root_f.Close()
+
+    if args.plot:
+        plt.show()
+
