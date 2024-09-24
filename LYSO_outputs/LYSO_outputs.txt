@@ -1,0 +1,13 @@
+LYSO_outputs contiene i risultati dell'analisi dello spettro intrinseco del LYSO.
+Sono riportati i risultati con diversa statistica: 1 run equivale a 100000 eventi (come per le attuali run con il sodio).
+NOTA: ogni run ha tuttavia solo 2000 eventi spe, 1/10 delle attuali run del sodio: ogni risultato che utilizza i fit di spe charge per run<10 risulterà peggiore delle run con sodio.
+
+per ogni barra {bar} si riporta:
+h_unfiltered{bar}:  spettro grezzo per ogni barra, filtrando esclusivamente eventi a con carica troppo bassa
+trigger_bar_ch{bar}: spettro delle barre principali di trigger; si filtrano gli eventi con energia minore di 350eV
+h_first_nbr_ch{bar}: spettro dei primi vicini rispetto alla barra di trigger, filtrando esclusivamente eventi con carica troppo bassa (analogamente a h_unfiltered)
+NOTA: qui con bar si intende la barra di trigger
+NOTA: si corregge il crosstalk, considerando una media di 8.5%; per ciascun evento si sottrae l' 8.5% della carica della barra principale
+
+second_nbr_trg_ch{bar}: spettro dei secondi vicini rispetto alla barra di trigger, filtrando esclusivamente eventi con carica troppo bassa (analogamente a h_unfiltered)
+NOTA: per i secondi vicini non si corregge il crosstalk, considerato un effetto piccolo
